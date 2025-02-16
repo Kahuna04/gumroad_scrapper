@@ -461,7 +461,7 @@ class GumroadScraper:
             return Product(url=url)  # Return empty product with just URL if scraping fails
 
     def scrape_all_products(self) -> pd.DataFrame:
-        """Scrape products from all sitemaps within the specified period"""
+        """Scrape products from sitemaps"""
         all_products = []
         processed_count = 0
         
@@ -494,16 +494,25 @@ class GumroadScraper:
                             for url in batch_urls:
                                 if processed_count >= self.max_products:
                                     logger.info(f"Reached maximum product limit of {self.max_products}")
+                                    # Save any remaining products before returning
+                                    if all_products:
+                                        self._save_batch(pd.DataFrame(all_products))
                                     return pd.DataFrame(all_products)
                                 
                                 product = self.scrape_product(url)
                                 all_products.append(product.to_dict())
                                 processed_count += 1
                                 
+                                # Log progress every 100 products but don't save
                                 if processed_count % 100 == 0:
                                     logger.info(f"Processed {processed_count} products")
+                                
+                                # Only save when we reach the batch size
+                                if len(all_products) >= self.batch_size:
+                                    logger.info(f"Saving batch of {len(all_products)} products")
                                     self._save_batch(pd.DataFrame(all_products))
-                            
+                                    all_products = []  # Clear the list after saving
+                        
                     except Exception as e:
                         logger.error(f"Error processing sub-sitemap {sub_url}: {e}")
                         continue
@@ -511,6 +520,10 @@ class GumroadScraper:
             except Exception as e:
                 logger.error(f"Error processing monthly sitemap {base_sitemap_url}: {e}")
                 continue
+        
+        # Save any remaining products
+        if all_products:
+            self._save_batch(pd.DataFrame(all_products))
         
         return pd.DataFrame(all_products)
 
