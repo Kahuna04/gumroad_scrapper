@@ -462,70 +462,88 @@ class GumroadScraper:
 
     def scrape_all_products(self) -> pd.DataFrame:
         """Scrape products from sitemaps"""
+        # Create output directory immediately
+        os.makedirs(self.output_dir, exist_ok=True)
+        logger.info(f"Created/verified output directory at {self.output_dir}")
+        
         all_products = []
         processed_count = 0
         
-        sitemap_urls = self.get_sitemap_urls_for_period()
-        
-        for base_sitemap_url in sitemap_urls:
-            try:
-                response = self.session.get(base_sitemap_url)
-                content = gzip.decompress(response.content)
-                root = ET.fromstring(content)
-                
-                sub_sitemap_urls = []
-                for sitemap in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc"):
-                    sub_sitemap_urls.append(sitemap.text)
-                
-                for sub_url in sub_sitemap_urls:
-                    try:
-                        response = self.session.get(sub_url)
-                        content = gzip.decompress(response.content)
-                        sub_root = ET.fromstring(content)
-                        
-                        product_urls = []
-                        for url in sub_root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc"):
-                            product_urls.append(url.text)
-                        
-                        # Process in batches
-                        for i in range(0, len(product_urls), self.batch_size):
-                            batch_urls = product_urls[i:i + self.batch_size]
-                            
-                            for url in batch_urls:
-                                if processed_count >= self.max_products:
-                                    logger.info(f"Reached maximum product limit of {self.max_products}")
-                                    # Save any remaining products before returning
-                                    if all_products:
-                                        self._save_batch(pd.DataFrame(all_products))
-                                    return pd.DataFrame(all_products)
-                                
-                                product = self.scrape_product(url)
-                                all_products.append(product.to_dict())
-                                processed_count += 1
-                                
-                                # Log progress every 100 products but don't save
-                                if processed_count % 100 == 0:
-                                    logger.info(f"Processed {processed_count} products")
-                                
-                                # Only save when we reach the batch size
-                                if len(all_products) >= self.batch_size:
-                                    logger.info(f"Saving batch of {len(all_products)} products")
-                                    self._save_batch(pd.DataFrame(all_products))
-                                    all_products = []  # Clear the list after saving
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing sub-sitemap {sub_url}: {e}")
-                        continue
+        try:
+            sitemap_urls = self.get_sitemap_urls_for_period()
+            
+            for base_sitemap_url in sitemap_urls:
+                try:
+                    response = self.session.get(base_sitemap_url)
+                    content = gzip.decompress(response.content)
+                    root = ET.fromstring(content)
                     
-            except Exception as e:
-                logger.error(f"Error processing monthly sitemap {base_sitemap_url}: {e}")
-                continue
-        
-        # Save any remaining products
-        if all_products:
-            self._save_batch(pd.DataFrame(all_products))
-        
-        return pd.DataFrame(all_products)
+                    sub_sitemap_urls = []
+                    for sitemap in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc"):
+                        sub_sitemap_urls.append(sitemap.text)
+                    
+                    for sub_url in sub_sitemap_urls:
+                        try:
+                            response = self.session.get(sub_url)
+                            content = gzip.decompress(response.content)
+                            sub_root = ET.fromstring(content)
+                            
+                            product_urls = []
+                            for url in sub_root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc"):
+                                product_urls.append(url.text)
+                            
+                            # Process in batches
+                            for i in range(0, len(product_urls), self.batch_size):
+                                batch_urls = product_urls[i:i + self.batch_size]
+                                
+                                for url in batch_urls:
+                                    if processed_count >= self.max_products:
+                                        logger.info(f"Reached maximum product limit of {self.max_products}")
+                                        # Save any remaining products before returning
+                                        if all_products:
+                                            self._save_batch(pd.DataFrame(all_products))
+                                        return pd.DataFrame(all_products)
+                                    
+                                    product = self.scrape_product(url)
+                                    all_products.append(product.to_dict())
+                                    processed_count += 1
+                                    
+                                    # Log progress every 100 products but don't save
+                                    if processed_count % 100 == 0:
+                                        logger.info(f"Processed {processed_count} products")
+                                    
+                                    # Only save when we reach the batch size
+                                    if len(all_products) >= self.batch_size:
+                                        logger.info(f"Saving batch of {len(all_products)} products")
+                                        self._save_batch(pd.DataFrame(all_products))
+                                        all_products = []  # Clear the list after saving
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing sub-sitemap {sub_url}: {e}")
+                            # Save current progress if we have products
+                            if all_products:
+                                self._save_interrupted_batch(pd.DataFrame(all_products))
+                            continue
+                        
+                except Exception as e:
+                    logger.error(f"Error processing monthly sitemap {base_sitemap_url}: {e}")
+                    # Save current progress if we have products
+                    if all_products:
+                        self._save_interrupted_batch(pd.DataFrame(all_products))
+                    continue
+            
+            # Save any remaining products
+            if all_products:
+                self._save_batch(pd.DataFrame(all_products))
+            
+            return pd.DataFrame(all_products)
+            
+        except Exception as e:
+            logger.error(f"Unexpected error during scraping: {e}")
+            # Save current progress if we have products
+            if all_products:
+                self._save_interrupted_batch(pd.DataFrame(all_products))
+            raise
 
     def _save_batch(self, df: pd.DataFrame):
         """Save intermediate results"""
@@ -546,6 +564,25 @@ class GumroadScraper:
             
         except Exception as e:
             logger.error(f"Error saving batch: {e}")
+
+    def _save_interrupted_batch(self, df: pd.DataFrame):
+        """Save products when scraping is interrupted"""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{self.output_dir}/gumroad_products_interrupted_{timestamp}.csv"
+            
+            df.to_csv(
+                filename,
+                index=False,
+                encoding='utf-8-sig',
+                escapechar='\\',
+                quoting=csv.QUOTE_ALL
+            )
+            
+            logger.info(f"Saved interrupted batch of {len(df)} products to {filename}")
+            
+        except Exception as e:
+            logger.error(f"Error saving interrupted batch: {e}")
 
     def cleanup(self):
         """Clean up resources"""
@@ -577,8 +614,27 @@ async def main():
         print(df[['title', 'price', 'sales_count']].head())
         print("\nResults have been saved to the 'output' directory.")
 
+    except KeyboardInterrupt:
+        print("\nScraping cancelled by user.")
+        logger.warning("Scraping interrupted by user - saving current progress")
+        if scraper and hasattr(scraper, '_save_interrupted_batch'):
+            # Try to save any unsaved data
+            try:
+                current_data = pd.DataFrame(scraper.all_products) if hasattr(scraper, 'all_products') else None
+                if current_data is not None and not current_data.empty:
+                    scraper._save_interrupted_batch(current_data)
+            except Exception as e:
+                logger.error(f"Could not save interrupted data: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in main: {str(e)}")
+        if scraper and hasattr(scraper, '_save_interrupted_batch'):
+            # Try to save any unsaved data
+            try:
+                current_data = pd.DataFrame(scraper.all_products) if hasattr(scraper, 'all_products') else None
+                if current_data is not None and not current_data.empty:
+                    scraper._save_interrupted_batch(current_data)
+            except Exception as save_error:
+                logger.error(f"Could not save interrupted data: {save_error}")
         raise
     finally:
         if scraper:
