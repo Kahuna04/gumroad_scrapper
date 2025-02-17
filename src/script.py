@@ -11,7 +11,6 @@ import logging
 import gzip
 import xml.etree.ElementTree as ET
 from fake_useragent import UserAgent
-from urllib.parse import urljoin
 import re
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -23,7 +22,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service as ChromeService
 from webdriver_manager.chrome import ChromeDriverManager
 import csv
-import xlsxwriter
 from dotenv import load_dotenv
 from dateutil.relativedelta import relativedelta
 from category_mapper import CategoryMapper
@@ -105,7 +103,6 @@ class GumroadScraper:
         self.user_agent = UserAgent()
         self.session = requests.Session()
         self.category_mapper = CategoryMapper()
-        self.category_cache = {}
         
         # Get total count immediately upon initialization
         self.total_products = self.count_total_products()
@@ -277,50 +274,6 @@ class GumroadScraper:
             logger.error(f"Failed to initialize Chrome driver: {e}")
             raise
 
-    def get_category_tree(self, url: str) -> str:
-        """Extract category tree from page"""
-        try:
-            # Try to get from cache
-            if url in self.category_cache:
-                return self.category_cache[url]
-            
-            # Try to extract from the page breadcrumb
-            try:
-                breadcrumb_xpath = '//nav[contains(@class, "breadcrumbs")]//a'
-                breadcrumb_elements = self.driver.find_elements(By.XPATH, breadcrumb_xpath)
-                
-                if breadcrumb_elements:
-                    category_parts = []
-                    for element in breadcrumb_elements:
-                        category_text = element.text.strip()
-                        if category_text and category_text.lower() != 'home':
-                            category_parts.append(category_text)
-                    
-                    if category_parts:
-                        category_tree = " > ".join(category_parts)
-                        self.category_cache[url] = category_tree
-                        return category_tree
-            except Exception as e:
-                logger.warning(f"Could not extract category from breadcrumb: {e}")
-            
-            # If no breadcrumb found, try alternative category element
-            try:
-                category_xpath = '//div[contains(@class, "category-label")]'
-                category_element = self.driver.find_element(By.XPATH, category_xpath)
-                if category_element:
-                    category_text = category_element.text.strip()
-                    if category_text:
-                        self.category_cache[url] = category_text
-                        return category_text
-            except Exception as e:
-                logger.warning(f"Could not extract category from label: {e}")
-            
-            return ""
-            
-        except Exception as e:
-            logger.error(f"Error getting category tree: {e}")
-            return ""
-
     def get_sitemap_urls(self) -> List[str]:
         """Extract product URLs and categories from Gumroad sitemaps"""
         try:
@@ -465,16 +418,10 @@ class GumroadScraper:
                 product.last_updated = datetime.now().isoformat()
                 
                 # After extracting title and description, detect category
-                detected_category = self.category_mapper.detect_category(
+                product.category_tree = self.category_mapper.detect_category(
                     title=product.title,
                     description=product.description
                 )
-                
-                # Combine detected category with any existing category tree
-                if product.category_tree:
-                    product.category_tree = f"{product.category_tree} > {detected_category}"
-                else:
-                    product.category_tree = detected_category
                 
                 # Add a randomized delay between requests
                 time.sleep(random.uniform(self.delay_min, self.delay_max))
