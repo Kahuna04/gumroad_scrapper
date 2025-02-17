@@ -247,14 +247,25 @@ class GumroadScraper:
         return total_products
 
     def _initialize_driver(self):
-        """Initialize the Chrome driver with appropriate options"""
+        """Initialize the Chrome driver with improved options"""
         try:
             chrome_options = webdriver.ChromeOptions()
             chrome_options.add_argument("--headless")
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-infobars")
+            chrome_options.add_argument("--disable-notifications")
+            chrome_options.add_argument("--disable-popup-blocking")
+            chrome_options.add_argument("--disable-web-security")
+            chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
             chrome_options.add_argument(f"user-agent={self.user_agent.random}")
+            
+            # Add performance options
+            chrome_options.add_argument("--disable-javascript")  # Disable JS if not needed
+            chrome_options.add_argument("--blink-settings=imagesEnabled=false")  # Disable images
+            chrome_options.add_argument("--disk-cache-size=1")  # Minimize disk cache
             
             self.driver = webdriver.Chrome(
                 service=ChromeService(ChromeDriverManager().install()),
@@ -346,119 +357,149 @@ class GumroadScraper:
             return []
 
     def scrape_product(self, url: str) -> Product:
-        """Scrape individual product page"""
-        try:
-            self.driver.get(url)
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="product_page"]'))
-            )
-            
-            product = Product(url=url)
-            
-            # Extract category first as it might be useful for other fields
-            product.category_tree = self.get_category_tree(url)
-            
-            # Extract product details
+        """Scrape individual product page with improved timeout handling"""
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
             try:
-                # Get product image
-                img_element = self.driver.find_element(
-                    By.CSS_SELECTOR, 'img.preview[itemprop="image"]'
+                # Set shorter page load timeout
+                self.driver.set_page_load_timeout(20)
+                self.driver.get(url)
+                
+                # Wait for product page with explicit timeout
+                try:
+                    WebDriverWait(self.driver, 15).until(
+                        EC.presence_of_element_located((By.XPATH, '//*[@id="product_page"]'))
+                    )
+                except Exception as wait_error:
+                    logger.warning(f"Timeout waiting for product page: {wait_error}")
+                    retry_count += 1
+                    time.sleep(self.retry_backoff ** retry_count)
+                    continue
+                
+                product = Product(url=url)
+                
+                # Extract product details with individual try-except blocks
+                try:
+                    # Get product image with shorter timeout
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, 'img.preview[itemprop="image"]'))
+                    )
+                    img_element = self.driver.find_element(
+                        By.CSS_SELECTOR, 'img.preview[itemprop="image"]'
+                    )
+                    product.image_url = img_element.get_attribute('src')
+                except Exception as e:
+                    logger.debug(f"No image found: {e}")
+                
+                try:
+                    # Get title
+                    title_xpath = '//main/section[2]/article/section[1]/header/h1'
+                    product.title = self.driver.find_element(By.XPATH, title_xpath).text
+                except Exception as e:
+                    logger.warning(f"Could not find title for {url}: {e}")
+                    
+                try:
+                    # Get description
+                    desc_xpath = '//main/section[2]/article/section[1]/section[2]/div'
+                    product.description = self.driver.find_element(By.XPATH, desc_xpath).text
+                except Exception as e:
+                    logger.warning(f"Could not find description for {url}: {e}")
+                    
+                try:
+                    # Get price
+                    price_xpath = '//main/section[2]/article/section[1]/section[1]/div[1]/div[1]/div[1]'
+                    price_element = self.driver.find_element(By.XPATH, price_xpath)
+                    product.price = price_element.text.strip()
+                except Exception as e:
+                    logger.warning(f"Could not find price for {url}: {e}")
+                    
+                try:
+                    # Get product size
+                    size_xpath = '//main/section[2]/article/section[2]/section/div[1]/div[1]/div'
+                    size_element = self.driver.find_element(By.XPATH, size_xpath)
+                    product.size = size_element.text.strip()
+                except Exception as e:
+                    logger.warning(f"Could not find size for {url}: {e}")
+                    
+                try:
+                    # Get seller name
+                    seller_xpath = '//main/section[2]/article/section[1]/section[1]/div[2]/a'
+                    seller_element = self.driver.find_element(By.XPATH, seller_xpath)
+                    product.seller_name = seller_element.text
+                    product.seller_url = seller_element.get_attribute('href')
+                except Exception as e:
+                    logger.warning(f"Could not find seller details for {url}: {e}")
+
+                # New fields extraction
+                try:
+                    rating_count_xpath = '//main/section[2]/article/section[1]/section[1]/div[3]/span[6]'
+                    rating_count_element = self.driver.find_element(By.XPATH, rating_count_xpath)
+                    rating_count_text = rating_count_element.text.strip()
+                    # Extract number from text (e.g., "123 ratings" -> 123)
+                    product.rating_count = int(''.join(filter(str.isdigit, rating_count_text)))
+                except Exception as e:
+                    logger.warning(f"Could not find rating count for {url}: {e}")
+
+                try:
+                    rating_score_xpath = '//main/section[2]/article/section[2]/section[2]/header/div/div'
+                    rating_score_element = self.driver.find_element(By.XPATH, rating_score_xpath)
+                    rating_score_text = rating_score_element.text.strip()
+                    # Convert text to float (e.g., "4.5" -> 4.5)
+                    product.rating_score = float(rating_score_text)
+                except Exception as e:
+                    logger.warning(f"Could not find rating score for {url}: {e}")
+
+                try:
+                    # Updated XPath for sales count
+                    sales_xpath = "//span/strong[contains(following-sibling::text(), 'sale')]"
+                    sales_element = self.driver.find_element(By.XPATH, sales_xpath)
+                    sales_text = sales_element.text.strip()
+                    # Remove commas from numbers like "4,472"
+                    product.sales_count = sales_text.replace(',', '')
+                except Exception as e:
+                    logger.debug(f"Could not find sales count for {url}: {e}")
+                    product.sales_count = ""
+                
+                product.last_updated = datetime.now().isoformat()
+                
+                # After extracting title and description, detect category
+                detected_category = self.category_mapper.detect_category(
+                    title=product.title,
+                    description=product.description
                 )
-                product.image_url = img_element.get_attribute('src')
-            except Exception as e:
-                logger.debug(f"No image found: {e}")
-            
-            try:
-                # Get title
-                title_xpath = '//main/section[2]/article/section[1]/header/h1'
-                product.title = self.driver.find_element(By.XPATH, title_xpath).text
-            except Exception as e:
-                logger.warning(f"Could not find title for {url}: {e}")
                 
-            try:
-                # Get description
-                desc_xpath = '//main/section[2]/article/section[1]/section[2]/div'
-                product.description = self.driver.find_element(By.XPATH, desc_xpath).text
-            except Exception as e:
-                logger.warning(f"Could not find description for {url}: {e}")
+                # Combine detected category with any existing category tree
+                if product.category_tree:
+                    product.category_tree = f"{product.category_tree} > {detected_category}"
+                else:
+                    product.category_tree = detected_category
                 
-            try:
-                # Get price
-                price_xpath = '//main/section[2]/article/section[1]/section[1]/div[1]/div[1]/div[1]'
-                price_element = self.driver.find_element(By.XPATH, price_xpath)
-                product.price = price_element.text.strip()
-            except Exception as e:
-                logger.warning(f"Could not find price for {url}: {e}")
+                # Add a randomized delay between requests
+                time.sleep(random.uniform(self.delay_min, self.delay_max))
                 
-            try:
-                # Get product size
-                size_xpath = '//main/section[2]/article/section[2]/section/div[1]/div[1]/div'
-                size_element = self.driver.find_element(By.XPATH, size_xpath)
-                product.size = size_element.text.strip()
-            except Exception as e:
-                logger.warning(f"Could not find size for {url}: {e}")
+                return product
                 
-            try:
-                # Get seller name
-                seller_xpath = '//main/section[2]/article/section[1]/section[1]/div[2]/a'
-                seller_element = self.driver.find_element(By.XPATH, seller_xpath)
-                product.seller_name = seller_element.text
-                product.seller_url = seller_element.get_attribute('href')
             except Exception as e:
-                logger.warning(f"Could not find seller details for {url}: {e}")
-
-            # New fields extraction
-            try:
-                rating_count_xpath = '//main/section[2]/article/section[1]/section[1]/div[3]/span[6]'
-                rating_count_element = self.driver.find_element(By.XPATH, rating_count_xpath)
-                rating_count_text = rating_count_element.text.strip()
-                # Extract number from text (e.g., "123 ratings" -> 123)
-                product.rating_count = int(''.join(filter(str.isdigit, rating_count_text)))
-            except Exception as e:
-                logger.warning(f"Could not find rating count for {url}: {e}")
-
-            try:
-                rating_score_xpath = '//main/section[2]/article/section[2]/section[2]/header/div/div'
-                rating_score_element = self.driver.find_element(By.XPATH, rating_score_xpath)
-                rating_score_text = rating_score_element.text.strip()
-                # Convert text to float (e.g., "4.5" -> 4.5)
-                product.rating_score = float(rating_score_text)
-            except Exception as e:
-                logger.warning(f"Could not find rating score for {url}: {e}")
-
-            try:
-                # Updated XPath for sales count
-                sales_xpath = "//span/strong[contains(following-sibling::text(), 'sale')]"
-                sales_element = self.driver.find_element(By.XPATH, sales_xpath)
-                sales_text = sales_element.text.strip()
-                # Remove commas from numbers like "4,472"
-                product.sales_count = sales_text.replace(',', '')
-            except Exception as e:
-                logger.debug(f"Could not find sales count for {url}: {e}")
-                product.sales_count = ""
-            
-            product.last_updated = datetime.now().isoformat()
-            
-            # After extracting title and description, detect category
-            detected_category = self.category_mapper.detect_category(
-                title=product.title,
-                description=product.description
-            )
-            
-            # Combine detected category with any existing category tree
-            if product.category_tree:
-                product.category_tree = f"{product.category_tree} > {detected_category}"
-            else:
-                product.category_tree = detected_category
-            
-            # Add a small delay to avoid overwhelming the server
-            time.sleep(random.uniform(1, 3))
-            
-            return product
-            
-        except Exception as e:
-            logger.error(f"Error scraping product {url}: {e}")
-            return Product(url=url)  # Return empty product with just URL if scraping fails
+                retry_count += 1
+                logger.warning(f"Attempt {retry_count} failed for {url}: {str(e)}")
+                
+                if retry_count >= max_retries:
+                    logger.error(f"Failed to scrape product {url} after {max_retries} attempts")
+                    return Product(url=url)  # Return empty product after all retries fail
+                
+                # Exponential backoff between retries
+                time.sleep(self.retry_backoff ** retry_count)
+                
+                # Reset Chrome driver if we get timeout errors
+                if "timeout" in str(e).lower():
+                    try:
+                        self.driver.quit()
+                        self._initialize_driver()
+                        logger.info("Reset Chrome driver due to timeout")
+                    except Exception as driver_error:
+                        logger.error(f"Error resetting driver: {driver_error}")
 
     def scrape_all_products(self) -> pd.DataFrame:
         """Scrape products from sitemaps"""
