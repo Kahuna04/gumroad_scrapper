@@ -46,4 +46,3 @@ webencodings==0.5.1
 websocket-client==1.8.0
 wsproto==1.2.0
 yarl==1.18.3
-xlsxwriter
