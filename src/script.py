@@ -25,16 +25,12 @@ import concurrent.futures
 from bs4 import BeautifulSoup
 import queue
 from functools import partial
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from playwright.async_api import async_playwright
 
 # Configure logging
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO,  # Changed from DEBUG to INFO to reduce log volume
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('logs/gumroad_scraper.log'),
@@ -105,8 +101,8 @@ class GumroadScraper:
         self.skip_dns_errors = os.getenv('SKIP_DNS_ERRORS', 'True').lower() == 'true'
         
         # Concurrency settings
-        self.max_workers = int(os.getenv('MAX_WORKERS', 20))
-        self.max_connections = int(os.getenv('MAX_CONNECTIONS', 20))
+        self.max_workers = int(os.getenv('MAX_WORKERS', 50))
+        self.max_connections = int(os.getenv('MAX_CONNECTIONS', 50))
         
         self.user_agent = UserAgent()
         self.session = requests.Session()
@@ -125,31 +121,13 @@ class GumroadScraper:
         # Get sitemap URLs once
         self.sitemap_urls = self.get_sitemap_urls_for_period()
         logger.info(f"Found {len(self.sitemap_urls)} monthly sitemaps to process")
-        
-        # Initialize Selenium WebDriver
-        self.selenium_driver = self.setup_selenium()
-
-    def setup_selenium(self):
-        """Initialize and return a Selenium WebDriver instance"""
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless')  # Run in headless mode
-        options.add_argument('--disable-gpu')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        driver = webdriver.Chrome(options=options)
-        return driver
-
-    def close_selenium(self):
-        """Close the Selenium WebDriver"""
-        if self.selenium_driver:
-            self.selenium_driver.quit()
 
     def get_sitemap_urls_for_period(self) -> List[str]:
         """Get all sitemap URLs for the specified time period"""
-        start_year = int(os.getenv('START_YEAR', 2024))
-        start_month = int(os.getenv('START_MONTH', 1))
-        end_year = int(os.getenv('END_YEAR', 2025))
-        end_month = int(os.getenv('END_MONTH', 2))
+        start_year = int(os.getenv('START_YEAR'))
+        start_month = int(os.getenv('START_MONTH'))
+        end_year = int(os.getenv('END_YEAR'))
+        end_month = int(os.getenv('END_MONTH'))
 
         start_date = date(start_year, start_month, 1)
         end_date = date(end_year, end_month, 1)
@@ -163,24 +141,43 @@ class GumroadScraper:
             current_date += relativedelta(months=1)
             
         return sitemap_urls
-
     async def fetch_url(self, session, url):
         """Fetch URL with retry logic using aiohttp"""
         retries = 0
         while retries < self.max_retries:
             try:
-                headers = {'User-Agent': self.user_agent.random}
+                # Create more varied headers
+                headers = {
+                    'User-Agent': self.user_agent.random,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Cache-Control': 'max-age=0',
+                }
+                
                 async with session.get(url, headers=headers, timeout=self.request_timeout) as response:
                     if response.status == 200:
                         return await response.read()
+                    elif response.status == 429:
+                        # Special handling for rate limiting
+                        retry_after = int(response.headers.get('Retry-After', self.retry_backoff ** (retries + 2)))
+                        logger.warning(f"Rate limited on {url}, waiting for {retry_after} seconds")
+                        await asyncio.sleep(retry_after)
                     else:
                         logger.warning(f"Failed to fetch {url}, status: {response.status}")
+                
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 logger.warning(f"Error fetching {url}: {e}")
             
             retries += 1
             if retries < self.max_retries:
-                await asyncio.sleep(self.retry_backoff ** retries)
+                # Exponential backoff
+                wait_time = self.retry_backoff ** (retries + 1)
+                logger.info(f"Retrying {url} in {wait_time} seconds (attempt {retries+1}/{self.max_retries})")
+                await asyncio.sleep(wait_time)
         
         return None
 
@@ -226,6 +223,12 @@ class GumroadScraper:
         except Exception as e:
             logger.error(f"Error processing sitemap {sitemap_url}: {e}")
             return []
+
+    async def process_all_sitemaps(self, session):
+        """Process all sitemaps in parallel"""
+        sitemap_tasks = [self.process_sitemap(session, sitemap_url) for sitemap_url in self.sitemap_urls]
+        results = await asyncio.gather(*sitemap_tasks)
+        return [url for sublist in results for url in sublist]
 
     def scrape_product_html(self, html, url):
         """Parse product details from HTML using BeautifulSoup"""
@@ -314,45 +317,46 @@ class GumroadScraper:
             
         except Exception as e:
             logger.error(f"Error parsing product HTML for {url}: {e}")
-            return Product(url=url)  # Return empty product on error
+            return Product(url=url)
 
-    def scrape_dynamic_content(self, url):
-        """Use Selenium to scrape dynamic content from the product page."""
+    async def scrape_dynamic_content_playwright(self, page, url):
+        """Use Playwright to scrape dynamic content from the product page."""
         try:
-            self.selenium_driver.get(url)
-            
-            # Wait for the page to load
-            WebDriverWait(self.selenium_driver, self.request_timeout).until(
-                EC.presence_of_element_located((By.TAG_NAME, 'body'))
-            )
-            
-            # Extract image URL
-            image_url = ""
+            await page.goto(url, timeout=self.request_timeout * 1000)  # Playwright uses milliseconds
+
+            # Wait for the image to load
             try:
-                image_element = self.selenium_driver.find_element(By.CSS_SELECTOR, 'img.preview[itemprop="image"]')
-                image_url = image_element.get_attribute('src')
+                await page.wait_for_selector('div[role="tabpanel"] img.preview[itemprop="image"]', timeout=10000)  # Wait up to 10 seconds
+                image_url = await page.evaluate('''() => {
+                    const img = document.querySelector('div[role="tabpanel"] img.preview[itemprop="image"]');
+                    return img ? img.src : '';
+                }''')
             except Exception as e:
-                logger.warning(f"Could not find image URL for {url}: {e}")
-            
-            # Extract description
-            description = ""
+                logger.debug(f"No image found: {e}")
+                image_url = ""
+
+            # Wait for the description to load
             try:
-                description_element = self.selenium_driver.find_element(By.XPATH, '//main/section[2]/article/section[1]/section[2]/div')
-                description = description_element.text
+                await page.wait_for_selector('div.rich-text div.tiptap.ProseMirror', timeout=10000)  # Wait up to 10 seconds
+                description = await page.evaluate('''() => {
+                    const desc = document.querySelector('div.rich-text div.tiptap.ProseMirror');
+                    return desc ? desc.textContent.trim() : '';
+                }''')
             except Exception as e:
                 logger.warning(f"Could not find description for {url}: {e}")
-            
+                description = ""
+
+            logger.debug(f"Scraped image_url: {image_url}")
+            logger.debug(f"Scraped description: {description}")
+
             return image_url, description
-            
-        except TimeoutException:
-            logger.warning(f"Timeout while waiting for page to load: {url}")
-            return "", ""
+
         except Exception as e:
             logger.error(f"Error scraping dynamic content for {url}: {e}")
             return "", ""
 
-    async def fetch_product(self, session, url):
-        """Fetch and process a product page using aiohttp and Selenium"""
+    async def fetch_product(self, session, url, page):
+        """Fetch and process a product page using aiohttp and Playwright"""
         try:
             # Add random delay to avoid rate limiting
             await asyncio.sleep(random.uniform(self.delay_min, self.delay_max))
@@ -369,8 +373,8 @@ class GumroadScraper:
                     partial(self.scrape_product_html, content, url)
                 )
 
-            # Use Selenium to extract dynamic content
-            image_url, description = self.scrape_dynamic_content(url)
+            # Use Playwright to extract dynamic content
+            image_url, description = await self.scrape_dynamic_content_playwright(page, url)
             product.image_url = image_url
             product.description = description
 
@@ -385,23 +389,39 @@ class GumroadScraper:
 
     async def process_batch(self, product_urls):
         """Process a batch of product URLs concurrently"""
-        connector = aiohttp.TCPConnector(limit=self.max_connections)
+        try:
+            import aiodns
+            resolver = aiohttp.AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])  # Use Google DNS and Cloudflare DNS
+        except ImportError:
+            logger.warning("aiodns library not found. Falling back to default resolver.")
+            resolver = None
+
+        connector = aiohttp.TCPConnector(
+            limit=self.max_connections,
+            resolver=resolver  # Use custom resolver if available, otherwise use default
+        )
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            tasks = []
-            for url in product_urls:
-                if url not in self.processed_urls:
-                    tasks.append(self.fetch_product(session, url))
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
 
-                # Limit concurrent tasks
-                if len(tasks) >= self.max_workers:
+                tasks = []
+                for url in product_urls:
+                    if url not in self.processed_urls:
+                        tasks.append(self.fetch_product(session, url, page))
+
+                    # Limit concurrent tasks
+                    if len(tasks) >= self.max_workers:
+                        await asyncio.gather(*tasks)
+                        tasks = []
+
+                # Process any remaining tasks
+                if tasks:
                     await asyncio.gather(*tasks)
-                    tasks = []
 
-            # Process any remaining tasks
-            if tasks:
-                await asyncio.gather(*tasks)
+                await browser.close()
 
     def save_results_from_queue(self):
         """Save results from the queue to CSV"""
@@ -437,19 +457,15 @@ class GumroadScraper:
 
         try:
             # Setup aiohttp session for sitemaps
-            async with aiohttp.ClientSession() as session:
-                # Process all sitemaps to get product URLs
-                all_product_urls = []
-                for sitemap_url in self.sitemap_urls:
-                    logger.info(f"Processing sitemap: {sitemap_url}")
-                    product_urls = await self.process_sitemap(session, sitemap_url)
-                    all_product_urls.extend(product_urls)
-
-                    # Break if we've found enough URLs
-                    if len(all_product_urls) >= self.max_products:
-                        all_product_urls = all_product_urls[:self.max_products]
-                        break
-
+            connector = aiohttp.TCPConnector(
+                limit=self.max_connections,
+                resolver=aiohttp.AsyncResolver(nameservers=["8.8.8.8", "1.1.1.1"])  # Use Google DNS and Cloudflare DNS
+            )
+            timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+            
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                # Process all sitemaps in parallel to get product URLs
+                all_product_urls = await self.process_all_sitemaps(session)
                 logger.info(f"Found {len(all_product_urls)} unique product URLs to process")
 
                 # Process product URLs in batches
@@ -486,9 +502,6 @@ class GumroadScraper:
             # Save any results in queue before exiting
             self.save_results_from_queue()
             raise
-        finally:
-            # Close Selenium driver
-            self.close_selenium()
 
     def combine_csv_files(self):
         """Combine all CSV files in output directory into one final file"""
@@ -645,10 +658,6 @@ async def main():
             except Exception as save_error:
                 logger.error(f"Could not save interrupted data: {save_error}")
         raise
-    finally:
-        # Close Selenium driver
-        if scraper:
-            scraper.close_selenium()
 
 if __name__ == "__main__":
     try:
