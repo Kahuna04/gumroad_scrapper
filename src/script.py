@@ -249,10 +249,7 @@ class GumroadScraper:
                 # Extract price
                 price_element = soup.select_one('main section article section section div div div')
                 if price_element:
-                    price_text = price_element.text.strip()
-                    # Use regex to extract only numbers and decimal points
-                    price_numbers = re.sub(r'[^\d.]', '', price_text)
-                    product.price = price_numbers
+                    product.price = price_element.text.strip()
             except Exception as e:
                 logger.warning(f"Could not find price for {url}: {e}")
                 
