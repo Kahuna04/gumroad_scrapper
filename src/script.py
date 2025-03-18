@@ -25,7 +25,6 @@ import concurrent.futures
 from bs4 import BeautifulSoup
 import queue
 from functools import partial
-from playwright.async_api import async_playwright
 
 # Configure logging
 os.makedirs('logs', exist_ok=True)
@@ -141,12 +140,12 @@ class GumroadScraper:
             current_date += relativedelta(months=1)
             
         return sitemap_urls
+
     async def fetch_url(self, session, url):
         """Fetch URL with retry logic using aiohttp"""
         retries = 0
         while retries < self.max_retries:
             try:
-                # Create more varied headers
                 headers = {
                     'User-Agent': self.user_agent.random,
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -160,9 +159,8 @@ class GumroadScraper:
                 
                 async with session.get(url, headers=headers, timeout=self.request_timeout) as response:
                     if response.status == 200:
-                        return await response.read()
+                        return await response.read()  # Return raw binary content
                     elif response.status == 429:
-                        # Special handling for rate limiting
                         retry_after = int(response.headers.get('Retry-After', self.retry_backoff ** (retries + 2)))
                         logger.warning(f"Rate limited on {url}, waiting for {retry_after} seconds")
                         await asyncio.sleep(retry_after)
@@ -174,22 +172,24 @@ class GumroadScraper:
             
             retries += 1
             if retries < self.max_retries:
-                # Exponential backoff
                 wait_time = self.retry_backoff ** (retries + 1)
                 logger.info(f"Retrying {url} in {wait_time} seconds (attempt {retries+1}/{self.max_retries})")
                 await asyncio.sleep(wait_time)
         
         return None
-
+    
     async def process_sitemap(self, session, sitemap_url):
         """Process a sitemap and return product URLs"""
         try:
+            # Fetch the raw binary content
             content = await self.fetch_url(session, sitemap_url)
             if not content:
                 return []
             
             try:
+                # Decompress the gzip content
                 decompressed = gzip.decompress(content)
+                # Parse the XML from the decompressed content
                 root = ET.fromstring(decompressed)
                 
                 # If this is a sitemap index (contains other sitemaps)
@@ -249,7 +249,10 @@ class GumroadScraper:
                 # Extract price
                 price_element = soup.select_one('main section article section section div div div')
                 if price_element:
-                    product.price = price_element.text.strip()
+                    price_text = price_element.text.strip()
+                    # Use regex to extract only numbers and decimal points
+                    price_numbers = re.sub(r'[^\d.]', '', price_text)
+                    product.price = price_numbers
             except Exception as e:
                 logger.warning(f"Could not find price for {url}: {e}")
                 
@@ -306,6 +309,22 @@ class GumroadScraper:
             except Exception as e:
                 logger.warning(f"Could not find rating score for {url}: {e}")
 
+            # Extract image URL
+            try:
+                image_element = soup.select_one('link[rel="preload"][as="image"]')
+                if image_element:
+                    product.image_url = image_element.get('href', '')
+            except Exception as e:
+                logger.warning(f"Could not find image URL for {url}: {e}")
+
+            # Extract description
+            try:
+                description_element = soup.select_one('meta[name="description"]')
+                if description_element:
+                    product.description = description_element.get('content', '')
+            except Exception as e:
+                logger.warning(f"Could not find description for {url}: {e}")
+
             # Category detection
             product.category_tree = self.category_mapper.detect_category(
                 title=product.title,
@@ -319,48 +338,13 @@ class GumroadScraper:
             logger.error(f"Error parsing product HTML for {url}: {e}")
             return Product(url=url)
 
-    async def scrape_dynamic_content_playwright(self, page, url):
-        """Use Playwright to scrape dynamic content from the product page."""
-        try:
-            await page.goto(url, timeout=self.request_timeout * 1000)  # Playwright uses milliseconds
-
-            # Wait for the image to load
-            try:
-                await page.wait_for_selector('div[role="tabpanel"] img.preview[itemprop="image"]', timeout=10000)  # Wait up to 10 seconds
-                image_url = await page.evaluate('''() => {
-                    const img = document.querySelector('div[role="tabpanel"] img.preview[itemprop="image"]');
-                    return img ? img.src : '';
-                }''')
-            except Exception as e:
-                logger.debug(f"No image found: {e}")
-                image_url = ""
-
-            # Wait for the description to load
-            try:
-                await page.wait_for_selector('div.rich-text div.tiptap.ProseMirror', timeout=10000)  # Wait up to 10 seconds
-                description = await page.evaluate('''() => {
-                    const desc = document.querySelector('div.rich-text div.tiptap.ProseMirror');
-                    return desc ? desc.textContent.trim() : '';
-                }''')
-            except Exception as e:
-                logger.warning(f"Could not find description for {url}: {e}")
-                description = ""
-
-            logger.debug(f"Scraped image_url: {image_url}")
-            logger.debug(f"Scraped description: {description}")
-
-            return image_url, description
-
-        except Exception as e:
-            logger.error(f"Error scraping dynamic content for {url}: {e}")
-            return "", ""
-
-    async def fetch_product(self, session, url, page):
-        """Fetch and process a product page using aiohttp and Playwright"""
+    async def fetch_product(self, session, url):
+        """Fetch and process a product page using aiohttp and BeautifulSoup"""
         try:
             # Add random delay to avoid rate limiting
             await asyncio.sleep(random.uniform(self.delay_min, self.delay_max))
             
+            # Fetch the page content
             content = await self.fetch_url(session, url)
             if not content:
                 return Product(url=url)
@@ -372,11 +356,6 @@ class GumroadScraper:
                     executor, 
                     partial(self.scrape_product_html, content, url)
                 )
-
-            # Use Playwright to extract dynamic content
-            image_url, description = await self.scrape_dynamic_content_playwright(page, url)
-            product.image_url = image_url
-            product.description = description
 
             self.processed_urls.add(url)
             self.results_queue.put(product.to_dict())
@@ -403,25 +382,19 @@ class GumroadScraper:
         timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
+            tasks = []
+            for url in product_urls:
+                if url not in self.processed_urls:
+                    tasks.append(self.fetch_product(session, url))
 
-                tasks = []
-                for url in product_urls:
-                    if url not in self.processed_urls:
-                        tasks.append(self.fetch_product(session, url, page))
-
-                    # Limit concurrent tasks
-                    if len(tasks) >= self.max_workers:
-                        await asyncio.gather(*tasks)
-                        tasks = []
-
-                # Process any remaining tasks
-                if tasks:
+                # Limit concurrent tasks
+                if len(tasks) >= self.max_workers:
                     await asyncio.gather(*tasks)
+                    tasks = []
 
-                await browser.close()
+            # Process any remaining tasks
+            if tasks:
+                await asyncio.gather(*tasks)
 
     def save_results_from_queue(self):
         """Save results from the queue to CSV"""
@@ -619,9 +592,6 @@ async def main():
     scraper = None
     try:
         scraper = GumroadScraper()
-        
-        # This is now done in the scrape_all_products method
-        # print(f"Will scrape products out of approximately {scraper.total_products} total available")
         
         print("\nBeginning product scraping...")
         print("=" * 50)
