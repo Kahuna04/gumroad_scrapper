@@ -84,9 +84,9 @@ class Product:
 
 class GumroadScraper:
     def __init__(self):
-        self.max_retries = int(os.getenv('MAX_RETRIES', 3))
-        self.delay_min = float(os.getenv('DELAY_MIN', 0.5))
-        self.delay_max = float(os.getenv('DELAY_MAX', 1.5))
+        self.max_retries = int(os.getenv('MAX_RETRIES'))
+        self.delay_min = float(os.getenv('DELAY_MIN'))
+        self.delay_max = float(os.getenv('DELAY_MAX'))
         self.max_products = int(os.getenv('MAX_PRODUCTS'))
         self.batch_size = int(os.getenv('BATCH_SIZE'))
         self.output_dir = 'output'
@@ -100,8 +100,8 @@ class GumroadScraper:
         self.skip_dns_errors = os.getenv('SKIP_DNS_ERRORS', 'True').lower() == 'true'
         
         # Concurrency settings
-        self.max_workers = int(os.getenv('MAX_WORKERS', 50))
-        self.max_connections = int(os.getenv('MAX_CONNECTIONS', 50))
+        self.max_workers = int(os.getenv('MAX_WORKERS', 10))
+        self.max_connections = int(os.getenv('MAX_CONNECTIONS', 10))
         
         self.user_agent = UserAgent()
         self.session = requests.Session()
