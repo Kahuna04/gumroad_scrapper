@@ -142,7 +142,6 @@ class GumroadScraper:
         return sitemap_urls
 
     async def fetch_url(self, session, url):
-        """Fetch URL with retry logic using aiohttp"""
         retries = 0
         while retries < self.max_retries:
             try:
@@ -156,28 +155,31 @@ class GumroadScraper:
                     'Upgrade-Insecure-Requests': '1',
                     'Cache-Control': 'max-age=0',
                 }
-                
+
                 async with session.get(url, headers=headers, timeout=self.request_timeout) as response:
                     if response.status == 200:
                         return await response.read()  # Return raw binary content
+                    elif response.status == 404:
+                        logger.warning(f"Product not found (404): {url}")
+                        return None  # Skip this URL
                     elif response.status == 429:
                         retry_after = int(response.headers.get('Retry-After', self.retry_backoff ** (retries + 2)))
                         logger.warning(f"Rate limited on {url}, waiting for {retry_after} seconds")
                         await asyncio.sleep(retry_after)
                     else:
                         logger.warning(f"Failed to fetch {url}, status: {response.status}")
-                
+
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 logger.warning(f"Error fetching {url}: {e}")
-            
+
             retries += 1
             if retries < self.max_retries:
                 wait_time = self.retry_backoff ** (retries + 1)
                 logger.info(f"Retrying {url} in {wait_time} seconds (attempt {retries+1}/{self.max_retries})")
                 await asyncio.sleep(wait_time)
-        
+
         return None
-    
+        
     async def process_sitemap(self, session, sitemap_url):
         """Process a sitemap and return product URLs"""
         try:
